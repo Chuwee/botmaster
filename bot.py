@@ -36,7 +36,18 @@ PASSWORD = os.environ.get('BOT_PASSWORD', 'changeme')
 SERVICES_DIR = Path(__file__).parent.parent  # Parent directory
 
 # Store authenticated users
+# Note: Using in-memory storage means authentication state is lost on bot restart.
+# For production use, consider implementing persistent storage with session management.
 authenticated_users = set()
+
+
+def escape_markdown(text: str) -> str:
+    """Escape special characters for Markdown formatting."""
+    # Escape special markdown characters
+    special_chars = ['`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!', '\\']
+    for char in special_chars:
+        text = text.replace(char, '\\' + char)
+    return text
 
 
 def discover_services():
@@ -175,17 +186,21 @@ async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE, serv
         
         if result.returncode == 0:
             output = result.stdout if result.stdout else "Service started successfully"
+            # Truncate and escape output for safe display
+            output_truncated = output[:500]
             await query.message.reply_text(
                 f"✅ Service '{service_name}' started!\n\n"
-                f"Output:\n```\n{output[:500]}\n```",
-                parse_mode='Markdown'
+                f"Output:\n<pre>{escape_markdown(output_truncated)}</pre>",
+                parse_mode='HTML'
             )
         else:
             error = result.stderr if result.stderr else "Unknown error"
+            # Truncate and escape error for safe display
+            error_truncated = error[:500]
             await query.message.reply_text(
                 f"❌ Failed to start service '{service_name}'.\n\n"
-                f"Error:\n```\n{error[:500]}\n```",
-                parse_mode='Markdown'
+                f"Error:\n<pre>{escape_markdown(error_truncated)}</pre>",
+                parse_mode='HTML'
             )
     except subprocess.TimeoutExpired:
         await query.message.reply_text(
