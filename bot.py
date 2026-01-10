@@ -8,6 +8,7 @@ located in the parent directory that have a start.sh script.
 import os
 import subprocess
 import logging
+import asyncio
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -41,13 +42,31 @@ SERVICES_DIR = Path(__file__).parent.parent  # Parent directory
 authenticated_users = set()
 
 
-def escape_markdown(text: str) -> str:
-    """Escape special characters for Markdown formatting."""
-    # Escape special markdown characters
-    special_chars = ['`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!', '\\']
-    for char in special_chars:
-        text = text.replace(char, '\\' + char)
+def escape_html(text: str) -> str:
+    """Escape special characters for HTML formatting."""
+    # Escape HTML entities for safe display in parse_mode='HTML'
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
     return text
+
+
+def is_safe_service_name(service_name: str) -> bool:
+    """
+    Validate that service_name doesn't contain path traversal sequences.
+    Only allows alphanumeric characters, hyphens, underscores, and dots.
+    Prevents directory traversal attacks.
+    """
+    if not service_name:
+        return False
+    # Reject path traversal sequences
+    if '..' in service_name or '/' in service_name or '\\' in service_name:
+        return False
+    # Only allow safe characters: alphanumeric, hyphen, underscore, dot
+    import re
+    if not re.match(r'^[a-zA-Z0-9._-]+$', service_name):
+        return False
+    return True
 
 
 def discover_services():
@@ -112,7 +131,8 @@ async def show_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = "❌ No services found in the parent directory.\n\n" \
                   "Services must have a start.sh script."
         if update.callback_query:
-            await update.callback_query.message.reply_text(message)
+            if update.callback_query.message and hasattr(update.callback_query.message, 'reply_text'):
+                await update.callback_query.message.reply_text(message)
         else:
             await update.message.reply_text(message)
         return
@@ -130,7 +150,8 @@ async def show_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "🚀 Choose a service to start:"
     
     if update.callback_query:
-        await update.callback_query.message.reply_text(message, reply_markup=reply_markup)
+        if update.callback_query.message and hasattr(update.callback_query.message, 'reply_text'):
+            await update.callback_query.message.reply_text(message, reply_markup=reply_markup)
     else:
         await update.message.reply_text(message, reply_markup=reply_markup)
 
@@ -139,6 +160,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button presses."""
     query = update.callback_query
     await query.answer()
+    
+    # Check if message is available
+    if not query.message or not hasattr(query.message, 'reply_text'):
+        logger.warning("Callback query message is unavailable or inaccessible")
+        return
     
     user_id = update.effective_user.id
     
@@ -156,13 +182,46 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle service start
     if query.data.startswith("start_"):
         service_name = query.data[6:]  # Remove "start_" prefix
+        
+        # Validate service name to prevent path traversal
+        if not is_safe_service_name(service_name):
+            await query.message.reply_text(
+                "❌ Invalid service name. Service names must only contain "
+                "alphanumeric characters, hyphens, underscores, and dots."
+            )
+            logger.warning(f"Rejected unsafe service name: {service_name}")
+            return
+        
         await start_service(update, context, service_name)
 
 
 async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE, service_name: str):
     """Start the specified service."""
     query = update.callback_query
+    
+    # Check if message is available
+    if not query.message or not hasattr(query.message, 'reply_text'):
+        logger.warning("Callback query message is unavailable")
+        return
+    
     service_path = SERVICES_DIR / service_name / 'start.sh'
+    
+    # Verify the resolved path is still within SERVICES_DIR (prevent path traversal)
+    try:
+        resolved_service_path = service_path.resolve()
+        resolved_services_dir = SERVICES_DIR.resolve()
+        if not str(resolved_service_path).startswith(str(resolved_services_dir)):
+            logger.error(f"Path traversal attempt detected: {service_name}")
+            await query.message.reply_text(
+                "❌ Invalid service path."
+            )
+            return
+    except (ValueError, OSError) as e:
+        logger.error(f"Error resolving path for service {service_name}: {e}")
+        await query.message.reply_text(
+            f"❌ Error accessing service '{service_name}'."
+        )
+        return
     
     if not service_path.exists():
         await query.message.reply_text(
@@ -175,42 +234,55 @@ async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE, serv
     )
     
     try:
-        # Change to service directory and execute start.sh
-        result = subprocess.run(
-            ['bash', 'start.sh'],
+        # Use async subprocess to avoid blocking the event loop
+        process = await asyncio.create_subprocess_exec(
+            'bash', 'start.sh',
             cwd=service_path.parent,
-            capture_output=True,
-            text=True,
-            timeout=30
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         
-        if result.returncode == 0:
-            output = result.stdout if result.stdout else "Service started successfully"
+        # Wait for process with timeout
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=30.0
+            )
+            stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+            stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+        except asyncio.TimeoutError:
+            # Kill the process if it times out
+            process.kill()
+            await process.wait()
+            await query.message.reply_text(
+                f"⚠️ Service '{service_name}' is taking longer than expected.\n"
+                "It may still be starting in the background."
+            )
+            await show_services(update, context)
+            return
+        
+        if process.returncode == 0:
+            output = stdout_text if stdout_text else "Service started successfully"
             # Truncate and escape output for safe display
             output_truncated = output[:500]
             await query.message.reply_text(
                 f"✅ Service '{service_name}' started!\n\n"
-                f"Output:\n<pre>{escape_markdown(output_truncated)}</pre>",
+                f"Output:\n<pre>{escape_html(output_truncated)}</pre>",
                 parse_mode='HTML'
             )
         else:
-            error = result.stderr if result.stderr else "Unknown error"
+            error = stderr_text if stderr_text else "Unknown error"
             # Truncate and escape error for safe display
             error_truncated = error[:500]
             await query.message.reply_text(
                 f"❌ Failed to start service '{service_name}'.\n\n"
-                f"Error:\n<pre>{escape_markdown(error_truncated)}</pre>",
+                f"Error:\n<pre>{escape_html(error_truncated)}</pre>",
                 parse_mode='HTML'
             )
-    except subprocess.TimeoutExpired:
-        await query.message.reply_text(
-            f"⚠️ Service '{service_name}' is taking longer than expected.\n"
-            "It may still be starting in the background."
-        )
     except Exception as e:
         logger.error(f"Error starting service {service_name}: {e}")
         await query.message.reply_text(
-            f"❌ Error starting service '{service_name}': {str(e)}"
+            f"❌ Error starting service '{service_name}': {escape_html(str(e))}"
         )
     
     # Show services again
