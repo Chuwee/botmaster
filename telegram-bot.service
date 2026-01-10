@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Service Bot
+After=network.target
+
+[Service]
+Type=simple
+User=yourusername
+WorkingDirectory=/home/yourusername/botmaster
+Environment="TELEGRAM_BOT_TOKEN=your_token_here"
+Environment="BOT_PASSWORD=your_password_here"
+ExecStart=/usr/bin/python3 /home/yourusername/botmaster/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
