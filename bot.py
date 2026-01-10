@@ -9,6 +9,7 @@ import os
 import subprocess
 import logging
 import asyncio
+import re
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -63,7 +64,6 @@ def is_safe_service_name(service_name: str) -> bool:
     if '..' in service_name or '/' in service_name or '\\' in service_name:
         return False
     # Only allow safe characters: alphanumeric, hyphen, underscore, dot
-    import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', service_name):
         return False
     return True
@@ -210,7 +210,8 @@ async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE, serv
     try:
         resolved_service_path = service_path.resolve()
         resolved_services_dir = SERVICES_DIR.resolve()
-        if not str(resolved_service_path).startswith(str(resolved_services_dir)):
+        # Use is_relative_to for robust path validation (works on all filesystems)
+        if not resolved_service_path.is_relative_to(resolved_services_dir):
             logger.error(f"Path traversal attempt detected: {service_name}")
             await query.message.reply_text(
                 "❌ Invalid service path."
@@ -251,9 +252,15 @@ async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE, serv
             stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
             stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
         except asyncio.TimeoutError:
-            # Kill the process if it times out
-            process.kill()
-            await process.wait()
+            # Gracefully terminate the process if it times out
+            try:
+                process.terminate()  # Send SIGTERM for graceful shutdown
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # Force kill if process doesn't terminate gracefully
+                process.kill()
+                await process.wait()
+            
             await query.message.reply_text(
                 f"⚠️ Service '{service_name}' is taking longer than expected.\n"
                 "It may still be starting in the background."
